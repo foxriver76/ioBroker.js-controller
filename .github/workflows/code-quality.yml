@@ -1,8 +1,8 @@
-name: reviewdog
+name: Lint
 on: [pull_request]
 jobs:
   eslint:
-    name: runner / eslint
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
@@ -10,5 +10,5 @@ jobs:
         uses: reviewdog/action-eslint@v1
         with:
           github_token: ${{ secrets.github_token }}
-          reporter: github-pr-review
+          reporter: github-pr-check
           eslint_flags: '.'
