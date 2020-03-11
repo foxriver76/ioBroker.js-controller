@@ -9,8 +9,8 @@
  *
  */
 'use strict';
-
-const schedule   = require('node-schedule');
+let x;
+var schedule   = require('node-schedule');
 const os         = require('os');
 const fs         = require('fs');
 const path       = require('path');
