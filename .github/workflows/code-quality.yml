@@ -1,8 +1,8 @@
-name: Lint
+name: reviewdog
 on: [pull_request]
 jobs:
   eslint:
-    name: Lint
+    name: runner / eslint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v1
