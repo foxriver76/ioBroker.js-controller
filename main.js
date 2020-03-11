@@ -551,7 +551,7 @@ function createObjects(onConnect) {
                             }
                         });
                     } else if (installQueue.find(obj => obj.id === id)) { // ignore object changes when still in install queue
-                        logger.debug(hostLogPrefix + ' ignore object change because adapter still in installation queue');
+                        logger.debug(hostLogPrefix + ' ignore object change because the adapter is still in installation/rebuild queue');
                     } else {
                         const _ipArr = getIPs();
                         if (procs[id].config && checkAndAddInstance(procs[id].config, _ipArr)) {
@@ -1703,6 +1703,7 @@ function processMessage(msg) {
     // important: Do not forget to update the list of protected commands in iobroker.admin/lib/socket.js for "socket.on('sendToHost'"
     // and iobroker.socketio/lib/socket.js
 
+    logger.debug('Incoming Host message ' + msg.command);
     switch (msg.command) {
         case 'shell':
             if (config.system && config.system.allowShellCommands) {
@@ -2205,34 +2206,40 @@ function processMessage(msg) {
             break;
 
         case 'updateMultihost':
-            (function () {
-                const result = startMultihost();
-                if (msg.callback) {
-                    sendTo(msg.from, msg.command, {result: result}, msg.callback);
-                }
-            })();
+            const result = startMultihost();
+            if (msg.callback) {
+                sendTo(msg.from, msg.command, {result: result}, msg.callback);
+            }
             break;
 
         case 'getInterfaces':
-            (function () {
-                if (msg.callback) {
-                    sendTo(msg.from, msg.command, {result: os.networkInterfaces()}, msg.callback);
-                }
-            })();
+            if (msg.callback) {
+                sendTo(msg.from, msg.command, {result: os.networkInterfaces()}, msg.callback);
+            }
             break;
 
         case 'upload': {
-            (function (msg) {
-                if (msg.message) {
-                    uploadTasks.push({adapter: msg.message, msg});
-                    // start upload if no tasks running
-                    uploadTasks.length === 1 && startAdapterUpload();
-                } else {
-                    logger.error('host.' + hostname + ' No adapter name is specified for upload command from  ' + msg.from);
-                }
-            })(msg);
+            if (msg.message) {
+                uploadTasks.push({adapter: msg.message, msg});
+                // start upload if no tasks running
+                uploadTasks.length === 1 && startAdapterUpload();
+            } else {
+                logger.error(hostLogPrefix + ' No adapter name is specified for upload command from  ' + msg.from);
+            }
             break;
         }
+
+        case 'rebuildAdapter':
+            if (!installQueue.some(entry => entry.id === msg.message.id)) {
+                logger.info(hostLogPrefix + ' ' + msg.message.id + ' will be rebuilt');
+                installQueue.push({id: msg.message.id, rebuild: true, rebuildViaInstall: msg.message.rebuildViaInstall});
+                // start install queue if not started
+                installQueue.length === 1 && installAdapters();
+            } else {
+                logger.info(hostLogPrefix + ' ' + msg.message.id + ' still in installQueue, rebuild will be done with install');
+            }
+            break;
+
     }
 }
 
@@ -2441,7 +2448,7 @@ function initInstances() {
     }
 }
 
-function checkVersion(id, name, version) {
+function checkVersion(id, name, version, instances) {
     let isFound = false;
 
     if (name === 'js-controller') {
@@ -2458,15 +2465,13 @@ function checkVersion(id, name, version) {
         }
     }
     if (!isFound) {
-        for (const p in hostAdapter) {
-            if (!hostAdapter.hasOwnProperty(p)) continue;
-            if (hostAdapter[p] && hostAdapter[p].config && hostAdapter[p].config.common && hostAdapter[p].config.common.name === name) {
-                if (version && !semver.satisfies(hostAdapter[p].config.common.version, version)) {
-                    logger.error(hostLogPrefix + ' startInstance ' + id + ': required adapter "' + name + '" has wrong version. Installed "' + hostAdapter[p].config.common.version + '", required "' + version + '"!');
-                    return false;
-                }
-                isFound = true;
+        const p = Object.keys(instances).find(p => instances[p] && instances[p].common && instances[p].common.name === name);
+        if (p) {
+            if (version && !semver.satisfies(instances[p].common.version, version)) {
+                logger.error(hostLogPrefix + ' startInstance ' + id + ': required adapter "' + name + '" has wrong version. Installed "' + instances[p].common.version + '", required "' + version + '"!');
+                return false;
             }
+            isFound = true;
         }
     }
 
@@ -2479,52 +2484,53 @@ function checkVersion(id, name, version) {
 }
 
 function checkVersions(id, deps) {
-    try {
-        if (deps instanceof Array) {
-            for (let d = 0; d < deps.length; deps++) {
-                let version = null;
-                let name    = null;
-                if (typeof deps[d] === 'object') {
-                    for (const n in deps[d]) {
-                        if (!deps[d].hasOwnProperty(n)) continue;
-                        name    = n;
-                        version = deps[d][n];
-                        break;
-                    }
-                } else {
-                    name = deps[d];
-                }
-                if (!checkVersion(id, name, version)) {
-                    return false;
-                }
+    return new Promise((resolve, reject) => {
+        objects.getObjectView('system', 'instance', {startkey: 'system.adapter.', endkey: 'system.adapter.\u9999'}, (err, res) => {
+            const instances = {};
+            if (res && res.rows) {
+                res.rows.forEach(item => instances[item.value._id] = item.value);
             }
-        } else if (typeof deps === 'object') {
-            if (deps.length !== undefined || deps[0]) {
-                for (const i in deps) {
-                    if (!deps.hasOwnProperty(i)) continue;
-                    for (const __name in deps[i]) {
-                        if (!deps[i].hasOwnProperty(__name)) continue;
-                        if (!checkVersion(id, __name, deps[__name][i])) {
-                            return false;
+            try {
+                if (deps instanceof Array) {
+                    for (let d = 0; d < deps.length; deps++) {
+                        let version = null;
+                        let name = null;
+                        if (typeof deps[d] === 'object') {
+                            for (const n in deps[d]) {
+                                if (!deps[d].hasOwnProperty(n)) continue;
+                                name = n;
+                                version = deps[d][n];
+                                break;
+                            }
+                        } else {
+                            name = deps[d];
+                        }
+                        if (!checkVersion(id, name, version, instances)) {
+                            return reject();
+                        }
+                    }
+                } else if (typeof deps === 'object') {
+                    if (deps.length !== undefined || deps[0]) {
+                        for (const i in deps) {
+                            if (!deps.hasOwnProperty(i)) continue;
+                            if (Object.keys(deps[i]).find(name => !checkVersion(id, name, deps[name][i], instances))) {
+                                return reject();
+                            }
+                        }
+                    } else {
+                        if (Object.keys(deps).find(name => !checkVersion(id, name, deps[name], instances))) {
+                            return reject();
                         }
                     }
                 }
-            } else {
-                for (const _name in deps) {
-                    if (!deps.hasOwnProperty(_name)) continue;
-                    if (!checkVersion(id, _name, deps[_name])) {
-                        return false;
-                    }
-                }
+            } catch (e) {
+                logger.error(hostLogPrefix + ' startInstance ' + id + ' [checkVersions]: ' + e);
+                logger.error(hostLogPrefix + ' startInstance ' + id + ' [checkVersions]: ' + JSON.stringify(deps));
+                return reject();
             }
-        }
-    }
-    catch (e) {
-        logger.error(hostLogPrefix + ' startInstance ' + id + ' [checkVersions]: ' + e);
-        logger.error(hostLogPrefix + ' startInstance ' + id + ' [checkVersions]: ' + JSON.stringify(deps));
-        return false;
-    }
-    return true;
+            resolve();
+        });
+    });
 }
 
 // Store process IDS to make possible kill them all by restart
@@ -2563,12 +2569,14 @@ function installAdapters() {
     if (!installQueue.length) return;
 
     const task = installQueue[0];
+    if (task.inProgress) return;
     let name = task.id.split('.')[2];
-    if (task.version) {
+    if (task.version && !task.rebuild) {
         name += '@' + task.version;
     }
 
-    if (compactGroupController) {
+    const commandScope = task.rebuild ? 'rebuild' : 'install';
+    if (compactGroupController && !task.rebuild) {
         logger.info(hostLogPrefix + ' adapter ' + name + ' is not installed, installation will be handled by main controller ... waiting ');
         setImmediate(() => {
             installQueue.shift();
@@ -2579,10 +2587,15 @@ function installAdapters() {
 
     if (procs[task.id].downloadRetry < 4) {
         procs[task.id].downloadRetry++;
-        logger.warn(hostLogPrefix + ' startInstance cannot find adapter "' + name + '". Try to install it... ' + procs[task.id].downloadRetry + ' attempt');
+
+        if (task.rebuild) {
+            logger.warn(hostLogPrefix + ' adapter "' + name + '" seems to be installed for a different version of Node.js. Trying to rebuild it... ' + procs[task.id].downloadRetry + ' attempt');
+        } else {
+            logger.warn(hostLogPrefix + ' startInstance cannot find adapter "' + name + '". Try to install it... ' + procs[task.id].downloadRetry + ' attempt');
+        }
 
         const installArgs = [];
-        if (task.installedFrom && procs[task.id].downloadRetry < 3) {
+        if (!task.rebuild && task.installedFrom && procs[task.id].downloadRetry < 3) {
             // two tries with installed location, afterwards we try normal npm version install
             if (task.installedFrom.includes('://')) {
                 installArgs.push('url');
@@ -2599,42 +2612,54 @@ function installAdapters() {
             }
         }
         else {
-            installArgs.push('install');
+            installArgs.push(commandScope);
             installArgs.push(name);
+            if (task.rebuildViaInstall) {
+                installArgs.push('--install');
+            }
         }
-        logger.info(hostLogPrefix + ' ' + tools.appName + ' ' + installArgs.join(' ') + ' using ' + ((procs[task.id].downloadRetry < 3 && task.installedFrom) ? 'installedFrom' : 'installedVersion'));
+        logger.info(hostLogPrefix + ' ' + tools.appName + ' ' + installArgs.join(' ') + (task.rebuild ? '' : ' using ' + ((procs[task.id].downloadRetry < 3 && task.installedFrom) ? 'installedFrom' : 'installedVersion')));
         installArgs.unshift(__dirname + '/' + tools.appName + '.js');
 
         try {
+            task.inProgress = true;
             const child = spawn('node', installArgs, {windowsHide: true});
             if (child.stdout) {
                 child.stdout.on('data', data => {
                     data = data.toString().replace(/\n/g, '');
-                    logger.info(hostLogPrefix + ' ' + tools.appName + ' npm-install: ' + data);
+                    logger.info(hostLogPrefix + ' ' + tools.appName + ' npm-' + commandScope + ': ' + data);
                 });
             }
             if (child.stderr) {
                 child.stderr.on('data', data => {
                     data = data.toString().replace(/\n/g, '');
-                    logger.error(hostLogPrefix + ' ' + tools.appName + ' npm-install: ' + data);
+                    logger.error(hostLogPrefix + ' ' + tools.appName + ' npm-' + commandScope + ': ' + data);
                 });
             }
 
             child.on('exit', exitCode => {
-                logger.info(hostLogPrefix + ' ' + tools.appName + ' npm-install: exit ' + exitCode);
+                logger.info(hostLogPrefix + ' ' + tools.appName + ' npm-' + commandScope + ': exit ' + exitCode);
                 installQueue.shift();
                 if (exitCode === EXIT_CODES.CANNOT_INSTALL_NPM_PACKET) {
+                    task.inProgress = false;
                     installQueue.push(task); // We add at the end again to try three times
-                } else if (!task.disabled) {
-                    if (!procs[task.id].config.common.enabled) {
-                        logger.info(hostLogPrefix + ' startInstance ' + task.id + ': should start instance but disabled, re-enable');
-                        states.setState(task.id + '.alive', {val: true, ack: false, from: hostObjectPrefix});
-                    }
-                    else {
-                        startInstance(task.id, task.wakeUp);
-                    }
                 } else {
-                    logger.debug(hostLogPrefix + ' ' + tools.appName + ' installation successfull but instance disabled');
+                    procs[task.id].needsRebuild = false;
+                    if (!task.disabled) {
+                        if (!procs[task.id].config.common.enabled) {
+                            logger.info(hostLogPrefix + ' startInstance ' + task.id + ': instance is disabled but should be started, re-enabling it');
+                            states.setState(task.id + '.alive', {val: true, ack: false, from: hostObjectPrefix});
+                        }
+                        else if (task.rebuild) {
+                            // on rebuild we send a restart signal via object change to also reach compact group processes
+                            objects.extendObject(task.id, {})
+                        }
+                        else {
+                            startInstance(task.id, task.wakeUp);
+                        }
+                    } else {
+                        logger.debug(hostLogPrefix + ' ' + tools.appName + ' ' + commandScope + ' successful but the instance is disabled');
+                    }
                 }
 
                 setTimeout(() => {
@@ -2642,21 +2667,25 @@ function installAdapters() {
                 }, 1000);
             });
             child.on('error', err => {
-                logger.error(hostLogPrefix + ' Cannot execute "' + __dirname + '/' + tools.appName + '.js install ' + name + ': ' + err);
+                logger.error(hostLogPrefix + ' Cannot execute "' + __dirname + '/' + tools.appName + '.js ' + commandScope + ' ' + name + ': ' + err);
                 setTimeout(() => {
                     installQueue.shift();
                     installAdapters();
                 }, 1000);
             });
         } catch (err) {
-            logger.error(hostLogPrefix + ' Cannot execute "' + __dirname + '/' + tools.appName + '.js install ' + name + ': ' + err);
+            logger.error(hostLogPrefix + ' Cannot execute "' + __dirname + '/' + tools.appName + '.js ' + commandScope + ' ' + name + ': ' + err);
             setTimeout(() => {
                 installQueue.shift();
                 installAdapters();
             }, 1000);
         }
     } else {
-        logger.error(hostLogPrefix + ' Cannot download and install adapter "' + name + '". To retry it disable/enable the adapter or restart host. Also check the error messages in the log!');
+        if (task.rebuild) {
+            logger.error(hostLogPrefix + ' Cannot rebuild adapter "' + name + '". To retry it disable/enable the adapter or restart host. Also check the error messages in the log or execute "npm install --production" in adapter directory manually!');
+        } else {
+            logger.error(hostLogPrefix + ' Cannot download and install adapter "' + name + '". To retry it disable/enable the adapter or restart host. Also check the error messages in the log!');
+        }
         setTimeout(() => {
             installQueue.shift();
             installAdapters();
@@ -2792,11 +2821,15 @@ function startInstance(id, wakeUp) {
 
     // Check if all required adapters installed and have valid version
     if (instance.common.dependencies) {
-        if (checkVersions(id, instance.common.dependencies)) {
-            delete instance.common.dependencies;
-        } else {
-            return;
-        }
+        return checkVersions(id, instance.common.dependencies)
+            .then(ok => {
+                delete instance.common.dependencies;
+                startInstance(id, wakeUp);
+            })
+            .catch(() => {
+                // do nothing
+                // Do not start this instance
+            });
     }
 
     let fileName = instance.common.main || 'main.js';
@@ -2822,7 +2855,9 @@ function startInstance(id, wakeUp) {
     let fileNameFull = path.join(adapterDir_ , fileName);
 
     // workaround for old vis.
-    if (instance.common.onlyWWW && name === 'vis') instance.common.onlyWWW = false;
+    if (instance.common.onlyWWW && name === 'vis') {
+        instance.common.onlyWWW = false;
+    }
 
     if (instance.common.mode !== 'extension' && (instance.common.onlyWWW || !fs.existsSync(fileNameFull))) {
         fileName = name + '.js';
@@ -2988,37 +3023,62 @@ function startInstance(id, wakeUp) {
                         if (procs[id] && procs[id].process) {
                             delete procs[id].process;
                         }
-                        if (code !== EXIT_CODES.ADAPTER_REQUESTED_TERMINATION &&
-                            !wakeUp &&
-                            connected &&
-                            !isStopping &&
-                            procs[id] &&
-                            procs[id].config &&
-                            procs[id].config.common &&
-                            procs[id].config.common.enabled &&
-                            (!procs[id].config.common.webExtension || !procs[id].config.native.webInstance) &&
-                            mode !== 'once'
-                        ) {
-                            logger.info(hostLogPrefix + ' Restart adapter ' + id + ' because enabled');
 
-                            const restartTimerExisting = !!procs[id].restartTimer;
-                            //noinspection JSUnresolvedVariable
-                            if (procs[id].restartTimer) {
-                                clearTimeout(procs[id].restartTimer);
-                            }
-                            procs[id].restartTimer = setTimeout(_id => startInstance(_id),
-                                code === EXIT_CODES.START_IMMEDIATELY_AFTER_STOP_HEX ? 1000 : ((procs[id].config.common.restartSchedule || restartTimerExisting) ? 1000 : 30000), id);
-                            // 4294967196 (-100) is special code that adapter wants itself to be restarted immediately
-                        } else {
-                            if (code === EXIT_CODES.ADAPTER_REQUESTED_TERMINATION) {
-                                logger.info(`${hostLogPrefix} Do not restart adapter ${id} because desired by instance`);
-                            } else
-                            if (mode !== 'once') {
-                                logger.info(`${hostLogPrefix} Do not restart adapter ${id} because disabled or deleted`);
+                        if (procs[id].needsRebuild) {
+                            procs[id].rebuildCounter = procs[id].rebuildCounter || 0;
+                            procs[id].rebuildCounter++;
+                            if (procs[id].rebuildCounter < 4) {
+                                logger.info(hostLogPrefix + ' Adapter ' + id + ' needs rebuild and will be restarted afterwards.');
+                                const msg = {
+                                    command: 'rebuildAdapter',
+                                    message: {
+                                        id: instance._id,
+                                        rebuildViaInstall: procs[id].rebuildCounter > 1
+                                    }
+                                };
+                                if (!compactGroupController) { // execute directly
+                                    processMessage(msg);
+                                } else { // send to main controller to make sure only one npm process runs at a time
+                                    sendTo('system.host.' + hostname, 'rebuildAdapter', msg);
+                                }
                             } else {
-                                logger.info(`${hostLogPrefix} instance ${id} terminated while should be started once`);
+                                logger.info(hostLogPrefix + ' Rebuild for adapter ' + id + ' not successful in 3 tries. Adapter will not be restarted again. Please execute "npm install --production" in adapter directory manually.');
+                            }
+                        } else {
+                            procs[id].rebuildCounter = 0;
+                            if (code !== EXIT_CODES.ADAPTER_REQUESTED_TERMINATION &&
+                                !wakeUp &&
+                                connected &&
+                                !isStopping &&
+                                procs[id] &&
+                                procs[id].config &&
+                                procs[id].config.common &&
+                                procs[id].config.common.enabled &&
+                                (!procs[id].config.common.webExtension || !procs[id].config.native.webInstance) &&
+                                mode !== 'once'
+                            ) {
+                                logger.info(hostLogPrefix + ' Restart adapter ' + id + ' because enabled');
+
+                                const restartTimerExisting = !!procs[id].restartTimer;
+                                //noinspection JSUnresolvedVariable
+                                if (procs[id].restartTimer) {
+                                    clearTimeout(procs[id].restartTimer);
+                                }
+                                procs[id].restartTimer = setTimeout(_id => startInstance(_id),
+                                    code === EXIT_CODES.START_IMMEDIATELY_AFTER_STOP_HEX ? 1000 : ((procs[id].config.common.restartSchedule || restartTimerExisting) ? 1000 : 30000), id);
+                                // 4294967196 (-100) is special code that adapter wants itself to be restarted immediately
+                            } else {
+                                if (code === EXIT_CODES.ADAPTER_REQUESTED_TERMINATION) {
+                                    logger.info(`${hostLogPrefix} Do not restart adapter ${id} because desired by instance`);
+                                } else
+                                if (mode !== 'once') {
+                                    logger.info(`${hostLogPrefix} Do not restart adapter ${id} because disabled or deleted`);
+                                } else {
+                                    logger.info(`${hostLogPrefix} instance ${id} terminated while should be started once`);
+                                }
                             }
                         }
+
                         storePids(); // Store all pids to make possible kill them all
                     });
                 };
@@ -3217,6 +3277,9 @@ function startInstance(id, wakeUp) {
                         const text = data.toString();
                         // show for debug
                         console.error(text);
+                        if (text.includes('NODE_MODULE_VERSION') || text.includes('npm rebuild')) {
+                            procs[id].needsRebuild = true;
+                        }
                         procs[id].errors = procs[id].errors || [];
                         const now = Date.now();
                         procs[id].errors.push({ts: now, text: text});
