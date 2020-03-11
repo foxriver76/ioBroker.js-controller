@@ -9,7 +9,7 @@
  *
  */
 'use strict';
-
+var test = 0;
 const schedule   = require('node-schedule');
 const os         = require('os');
 const fs         = require('fs');
