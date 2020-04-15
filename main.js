@@ -2817,7 +2817,7 @@ function cleanErrors(procObj, now, doOutput) {
                 const lines = procObj.errors[i].text.replace('\x1B[31merror\x1B[39m:', '').replace('\x1B[34mdebug\x1B[39m:', 'debug:').split('\n');
                 for (let k = 0; k < lines.length; k++) {
                     if (lines[k]) {
-                        logger.error(hostLogPrefix + ' Caught by controller[' + i + ']: ' + lines[k]);
+                        logger.error(`${hostLogPrefix} Caught by controller[${i}]: ${lines[k]}`);
                     }
                 }
             }
@@ -2866,7 +2866,14 @@ function startScheduledInstance(callback) {
                 states.setState(instance._id + '.sigKill', {val: 0, ack: false, from: hostObjectPrefix}, () => {
                     const args = [instance._id.split('.').pop(), instance.common.loglevel || 'info'];
                     try {
-                        procs[id].process = cp.fork(fileNameFull, args, {windowsHide: true});
+                        // check if its a python adapter, else assume nodejs default
+                        if (instance.common.platform && /python/.test(instance.common.platform.toLowerCase())) {
+                            procs[id].process = cp.spawn(fileNameFull, args, {windowsHide: true});
+                            procs[id].engine = 'python';
+                        } else {
+                            procs[id].process = cp.fork(fileNameFull, args, {windowsHide: true});
+                            procs[id].engine = 'node';
+                        }
                     } catch(err) {
                         logger.error(hostLogPrefix + ' instance ' + id + ' could not be started: ' + err);
                         delete procs[id].process;
@@ -3249,18 +3256,22 @@ function startInstance(id, wakeUp) {
                 const handleAdapterProcessStart = () => {
                     if (!procs[id].process) { // We were not able or should not start as compact mode
                         try {
-                            procs[id].process = cp.fork(fileNameFull, args, {
-                                stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-                                windowsHide: true
-                            });
+                            // check if its a python adapter, else assume nodejs default
+                            if (instance.common.platform && /python/.test(instance.common.platform.toLowerCase())) {
+                                procs[id].process = cp.spawn(fileNameFull, args, {windowsHide: true});
+                                procs[id].engine = 'python';
+                            } else {
+                                procs[id].process = cp.fork(fileNameFull, args, {windowsHide: true});
+                                procs[id].engine = 'node';
+                            }
                         } catch (err) {
-                            logger.error(hostLogPrefix + ' instance ' + instance._id + ' could not be started: ' + err);
+                            logger.error(`${hostLogPrefix} instance ${instance._id} could not be started: ${err}`);
                             delete procs[id].process;
                         }
                     }
 
                     if (!procs[id].startedInCompactMode && !procs[id].startedAsCompactGroup && procs[id].process) {
-                        states.setState(id + '.sigKill', {val: procs[id].process.pid, ack: true, from: hostObjectPrefix});
+                        states.setState(`${id}.sigKill`, {val: procs[id].process.pid, ack: true, from: hostObjectPrefix});
                     }
 
                     // catch error output
@@ -3539,9 +3550,16 @@ function startInstance(id, wakeUp) {
             //noinspection JSUnresolvedVariable
             if (instance.common.allowInit) {
                 try {
-                    procs[id].process = cp.fork(fileNameFull, args, {windowsHide: true});
+                    // check if its a python adapter, else assume nodejs default
+                    if (instance.common.platform && /python/.test(instance.common.platform.toLowerCase())) {
+                        procs[id].process = cp.spawn(fileNameFull, args, {windowsHide: true});
+                        procs[id].engine = 'python';
+                    } else {
+                        procs[id].process = cp.fork(fileNameFull, args, {windowsHide: true});
+                        procs[id].engine = 'node';
+                    }
                 } catch (err) {
-                    logger.info(hostLogPrefix + ' instance ' + instance._id + ' could not be started: ' + err);
+                    logger.info(`${hostLogPrefix} instance ${instance._id} could not be started: ${err}`);
                     delete procs[id].process;
                 }
                 if (procs[id].process) {
